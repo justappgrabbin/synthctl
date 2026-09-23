@@ -48,6 +48,11 @@ struct manifest {
 /* ---- image.c ---- */
 int  image_build(const char *rootfs_dir, const struct manifest *m,
                  const char *out_path, int gzip_payload);
+/* Build an image from a list of absolute host paths (preserving layout). */
+int  image_build_paths(const char **paths, int n, const struct manifest *m,
+                       const char *out_path, int gzip_payload);
+void image_set_prune(const char **prefixes, int n);
+void image_set_max_file_bytes(uint64_t b);
 int  image_inspect(const char *img_path, struct manifest *m_out,
                    uint64_t *payload_size_out, char *sha_out /*65*/);
 /* Unpack image payload into dest_dir (created). Returns 0 on success.
@@ -73,6 +78,15 @@ struct run_options {
 };
 /* Runs the container, returns its exit status (0..255) or -1 on setup error. */
 int  run_container(const struct run_options *opt);
+#ifdef __APPLE__
+int  run_container_darwin(const struct run_options *opt);
+#endif
+
+/* ---- snapshot.c ---- */
+int  snapshot_build(const char *out_path, const char *label,
+                    const char **extra_inc, int n_extra_inc,
+                    const char **extra_prune, int n_extra_prune,
+                    uint64_t max_file_mb, int gzip);
 
 /* ---- util ---- */
 const char *synthctl_home(void); /* ~/.synthctl, created on demand */
