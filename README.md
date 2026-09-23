@@ -4,13 +4,53 @@ A real container runtime and image format — **no Docker, no runc, no libcontai
 
 ```
 synthctl build rootfs/ -o app.synthimg --name myapp --entry "/bin/server"
-synthctl inspect app.synthimg        # manifest + sha256 integrity check
+synthctl snapshot -o my-computer.synthimg   # clone THIS machine, state and all
+synthctl inspect app.synthimg               # manifest + sha256 integrity check
 synthctl run app.synthimg --mem 64 --pids 32
 ```
 
+## Cloning your computer
+
+`synthctl snapshot` captures the live machine's state space — system binaries,
+libraries, `/etc` config, and your `$HOME` — into a single `.synthimg` that
+boots as an isolated clone of the machine:
+
+```
+synthctl snapshot -o my-computer.synthimg --label my-laptop \
+    --exclude /usr/lib/jvm --max-file-mb 500
+synthctl run my-computer.synthimg           # boot the clone
+```
+
+Machine identity travels in the manifest (`SYNTH_SOURCE_HOST`,
+`SYNTH_SOURCE_OS`, `SYNTH_SOURCE_KERNEL`, capture time), so the clone can
+introspect where it came from. Kernel views (`/proc`, `/sys`, `/dev`, `/run`)
+are never captured — they're regenerated fresh per container. Regenerable
+caches (`.cache`, npm, nuget) are pruned by default; `--include`/`--exclude`
+extend both sets. Verified end-to-end: a 1.07 GB clone of a live Debian 12
+machine boots with its own python, node, full `/etc`, and home directory —
+as PID 1 in its own namespaces.
+
+## Apple runtime (macOS)
+
+macOS has no Linux namespaces, no pivot_root, no cgroups — porting the Linux
+backend would be fake. `src/backend_darwin.c` is the honest Apple runtime,
+built on **Seatbelt** (`sandbox-exec`), the same kernel sandbox framework
+Apple uses for App Store apps:
+
+- deny-by-default profile; file reads/writes allowed only under the unpacked
+  `.synthimg` rootfs (+ dyld shared cache)
+- network denied by default, opt-in with `--host-net`
+- spawned, signaled, and reaped like the Linux backend
+
+Scope: the Darwin backend runs **Mach-O images captured on a Mac**
+(`synthctl snapshot` on macOS). A Linux-captured `.synthimg` holds ELF
+binaries and cannot execute on Darwin natively — that requires a VM layer
+(Virtualization.framework), which is future work, not faked here. The Darwin
+backend compiles only on macOS (`#ifdef __APPLE__`).
+
 ## How it works (the real mechanics)
 
-Everything Docker does, synthctl does directly, in ~1200 lines of C:
+Everything Docker does, synthctl does directly, in ~1800 lines of C:
 
 | Boundary | Mechanism |
 |---|---|
@@ -51,7 +91,7 @@ The test suite is not a mock. It runs a real container and verifies:
 - **Rootless networking is isolated-only.** Creating veth pairs / bridges requires real root. Containers get a fresh net namespace (`lo` only) or `--host-net`. This is the same constraint as rootless Docker without slirp4netns.
 - **cgroups v2 delegation is best-effort.** On hosts that don't delegate controllers to unprivileged users, limits fall back to rlimits (still real enforcement, just per-process rather than per-cgroup). It says so on stderr when this happens.
 - Some hardened/nested kernels block mounting `proc` from a user namespace via LSM policy. synthctl reports it and continues — PID isolation never depended on `/proc`.
-- x86_64 Linux. Images are arch-tagged in the manifest.
+- x86_64 Linux (Darwin backend for macOS). Images are arch-tagged in the manifest.
 
 ## CLI
 
@@ -60,6 +100,8 @@ build <rootfs> -o app.synthimg [--name N] [--entry "cmd"] [--env K=V]
       [--workdir /w] [--hostname h] [--plain]
 inspect app.synthimg
 unpack app.synthimg <dir>
+snapshot [-o me.synthimg] [--label N] [--include /p] [--exclude /p]
+      [--max-file-mb N] [--plain]
 run app.synthimg [--mem MB] [--pids N] [--ro] [--host-net] [--hostname h] [-- cmd...]
 images                     # list unpacked image cache (~/.synthctl/images)
 ```
