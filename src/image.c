@@ -144,8 +144,33 @@ int manifest_from_json(const char *json, struct manifest *m)
 
 /* ---------------- ustar writer ---------------- */
 
+static uint32_t rd32le(const unsigned char *p)
+{ return p[0] | (p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
+static void wr32le(unsigned char *p, uint32_t v)
+{ p[0] = v & 0xff; p[1] = (v >> 8) & 0xff; p[2] = (v >> 16) & 0xff; p[3] = (v >> 24) & 0xff; }
+
 static FILE *tar_w;         /* output stream */
 static long  tar_bytes;     /* bytes written */
+
+/* prune list: absolute path prefixes excluded from capture */
+static const char **g_prune;
+static int g_prune_n;
+static uint64_t g_max_file_bytes;   /* 0 = unlimited */
+
+void image_set_prune(const char **prefixes, int n)
+{ g_prune = prefixes; g_prune_n = n; }
+void image_set_max_file_bytes(uint64_t b)
+{ g_max_file_bytes = b; }
+
+static int pruned(const char *fullpath)
+{
+    for (int i = 0; i < g_prune_n; i++) {
+        size_t l = strlen(g_prune[i]);
+        if (!strncmp(fullpath, g_prune[i], l) &&
+            (fullpath[l] == '/' || fullpath[l] == 0)) return 1;
+    }
+    return 0;
+}
 
 static void tar_pad(void)
 {
@@ -163,11 +188,29 @@ static void tar_chksum(unsigned char h[512])
     h[155] = ' ';
 }
 
+/* set a possibly-long path into a ustar header using the prefix field:
+ * name(100) + prefix(155) joined as prefix/name. Returns -1 if unsplittable. */
+static int tar_set_name(unsigned char h[512], const char *path)
+{
+    size_t len = strlen(path);
+    if (len <= 100) { snprintf((char *)h, 100, "%s", path); return 0; }
+    /* split at a '/' so that suffix fits in name and head in prefix */
+    for (size_t i = len; i-- > 0; ) {
+        if (path[i] == '/' && len - i - 1 <= 100 && i <= 155) {
+            memcpy(h + 345, path, i);
+            memcpy(h, path + i + 1, len - i - 1);
+            return 0;
+        }
+    }
+    fprintf(stderr, "synthctl: path too long for tar, skipping: %s\n", path);
+    return -1;
+}
+
 /* walk rootfs dir and emit tar entries (relative paths, no leading ./) */
 static int tar_emit_dir(const char *dir, const char *prefix)
 {
     DIR *d = opendir(dir);
-    if (!d) return -1;
+    if (!d) { fprintf(stderr, "synthctl: skip unreadable dir %s: %s\n", dir, strerror(errno)); return 0; }
     struct dirent *e;
     while ((e = readdir(d))) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
@@ -175,14 +218,17 @@ static int tar_emit_dir(const char *dir, const char *prefix)
         snprintf(full, sizeof full, "%s/%s", dir, e->d_name);
         snprintf(rel, sizeof rel, "%s%s", prefix, e->d_name);
         struct stat st;
-        if (lstat(full, &st)) { closedir(d); return -1; }
+        if (lstat(full, &st)) { fprintf(stderr, "synthctl: lstat %s: %s\n", full, strerror(errno)); closedir(d); return -1; }
+        if (pruned(full)) continue;
+        if (S_ISREG(st.st_mode) && g_max_file_bytes &&
+            (uint64_t)st.st_size > g_max_file_bytes) continue;
         if (S_ISLNK(st.st_mode)) {
             char ln[1024]; ssize_t l = readlink(full, ln, sizeof ln - 1);
             if (l < 0) { closedir(d); return -1; }
             ln[l] = 0;
             /* header with rel path, link target */
             unsigned char h[512] = {0};
-            snprintf((char *)h, 100, "%s", rel);
+            if (tar_set_name(h, rel)) continue;
             snprintf((char *)h + 100, 8, "%07o", st.st_mode & 07777);
             snprintf((char *)h + 108, 8, "%07o", 0);
             snprintf((char *)h + 116, 8, "%07o", 0);
@@ -200,7 +246,7 @@ static int tar_emit_dir(const char *dir, const char *prefix)
             snprintf(drelp, sizeof drelp, "%s/", rel);
             /* emit dir header */
             unsigned char h[512] = {0};
-            snprintf((char *)h, 100, "%s", drelp);
+            if (tar_set_name(h, drelp)) continue;
             snprintf((char *)h + 100, 8, "%07o", st.st_mode & 07777);
             snprintf((char *)h + 108, 8, "%07o", 0);
             snprintf((char *)h + 116, 8, "%07o", 0);
@@ -216,9 +262,13 @@ static int tar_emit_dir(const char *dir, const char *prefix)
             continue;
         }
         if (S_ISREG(st.st_mode)) {
+            /* open first: unreadable files (e.g. /etc/shadow) are skipped,
+             * they must not abort a snapshot of the whole machine */
+            FILE *f = fopen(full, "rb");
+            if (!f) continue;
             /* write header then file contents read from `full` */
             unsigned char h[512] = {0};
-            snprintf((char *)h, 100, "%s", rel);
+            if (tar_set_name(h, rel)) { fclose(f); continue; }
             snprintf((char *)h + 100, 8, "%07o", st.st_mode & 07777);
             snprintf((char *)h + 108, 8, "%07o", 0);
             snprintf((char *)h + 116, 8, "%07o", 0);
@@ -228,8 +278,6 @@ static int tar_emit_dir(const char *dir, const char *prefix)
             memcpy(h + 257, "ustar", 6); memcpy(h + 263, "00", 2);
             tar_chksum(h);
             fwrite(h, 1, 512, tar_w); tar_bytes += 512;
-            FILE *f = fopen(full, "rb");
-            if (!f) { closedir(d); return -1; }
             char buf[65536]; size_t n;
             while ((n = fread(buf, 1, sizeof buf, f)) > 0) { fwrite(buf, 1, n, tar_w); tar_bytes += n; }
             fclose(f);
@@ -244,6 +292,100 @@ static void tar_end(void)
 {
     static const char zeros[1024] = {0};
     fwrite(zeros, 1, 1024, tar_w); tar_bytes += 1024;
+}
+
+/* emit one absolute path (file/dir/symlink), recursing into dirs.
+ * `rel` is the in-image path with no leading slash. */
+static int tar_emit_path(const char *full, const char *rel)
+{
+    if (pruned(full)) return 0;
+    struct stat st;
+    if (lstat(full, &st)) return 0; /* vanished: skip */
+    unsigned char h[512] = {0};
+    char namebuf[600];
+    snprintf(namebuf, sizeof namebuf, "%s%s", rel, S_ISDIR(st.st_mode) ? "/" : "");
+    if (tar_set_name(h, namebuf)) return 0;
+    snprintf((char *)h + 100, 8, "%07o", st.st_mode & 07777);
+    snprintf((char *)h + 108, 8, "%07o", 0);
+    snprintf((char *)h + 116, 8, "%07o", 0);
+    snprintf((char *)h + 124, 12, "%011lo",
+             S_ISREG(st.st_mode) ? (unsigned long)st.st_size : 0UL);
+    snprintf((char *)h + 136, 12, "%011lo", (unsigned long)st.st_mtime);
+    h[156] = S_ISDIR(st.st_mode) ? '5' : S_ISLNK(st.st_mode) ? '2' :
+             S_ISREG(st.st_mode) ? '0' : '?';
+    if (h[156] == '?') return 0;
+    if (S_ISLNK(st.st_mode)) {
+        char ln[1024]; ssize_t l = readlink(full, ln, sizeof ln - 1);
+        if (l < 0) return 0;
+        ln[l] = 0;
+        snprintf((char *)h + 157, 100, "%s", ln);
+    }
+    memcpy(h + 257, "ustar", 6); memcpy(h + 263, "00", 2);
+    tar_chksum(h);
+    fwrite(h, 1, 512, tar_w); tar_bytes += 512;
+    if (S_ISREG(st.st_mode)) {
+        if (g_max_file_bytes && (uint64_t)st.st_size > g_max_file_bytes) return 0;
+        FILE *f = fopen(full, "rb");
+        if (!f) return 0;
+        char buf[65536]; size_t n;
+        while ((n = fread(buf, 1, sizeof buf, f)) > 0) { fwrite(buf, 1, n, tar_w); tar_bytes += n; }
+        fclose(f);
+        tar_pad();
+    } else if (S_ISDIR(st.st_mode)) {
+        char prefix[4096];
+        snprintf(prefix, sizeof prefix, "%s/", rel);
+        return tar_emit_dir(full, prefix);
+    }
+    return 0;
+}
+
+/* build from a list of absolute host paths, preserving layout in-image */
+int image_build_paths(const char **paths, int n, const struct manifest *m,
+                      const char *out_path, int gzip_payload)
+{
+    FILE *tar_tmp = tmpfile();
+    if (!tar_tmp) { perror("tmpfile"); return -1; }
+    tar_w = tar_tmp; tar_bytes = 0;
+    for (int i = 0; i < n; i++) {
+        const char *p = paths[i];
+        while (*p == '/') p++;              /* strip leading slashes */
+        if (!*p) continue;
+        char abs[4096];
+        snprintf(abs, sizeof abs, "/%s", p);
+        if (tar_emit_path(abs, p)) { fclose(tar_tmp); return -1; }
+    }
+    tar_end();
+    fflush(tar_tmp);
+
+    FILE *payload = tar_tmp, *gz_tmp = NULL;
+    if (gzip_payload) {
+        gz_tmp = tmpfile();
+        if (!gz_tmp || gzip_stream(tar_tmp, gz_tmp)) { fclose(tar_tmp); return -1; }
+        payload = gz_tmp;
+    }
+    fflush(payload);
+    fseek(payload, 0, SEEK_END);
+    long payload_len = ftell(payload);
+
+    char mjson[8192];
+    if (manifest_to_json(m, mjson, sizeof mjson)) return -1;
+    unsigned char hdr[SYNTHIMG_HDR_LEN] = {0};
+    memcpy(hdr, SYNTHIMG_MAGIC, SYNTHIMG_MAGIC_LEN);
+    hdr[8] = SYNTHIMG_VERSION;
+    wr32le(hdr + 9, gzip_payload ? SYNTHIMG_FLAG_GZIP : 0);
+    wr32le(hdr + 13, (uint32_t)strlen(mjson));
+    if (sha256_file(payload, 0, payload_len, hdr + 17)) return -1;
+
+    FILE *out = fopen(out_path, "wb");
+    if (!out) { perror(out_path); return -1; }
+    fwrite(hdr, 1, sizeof hdr, out);
+    fwrite(mjson, 1, strlen(mjson), out);
+    fseek(payload, 0, SEEK_SET);
+    char buf[65536]; size_t nn;
+    while ((nn = fread(buf, 1, sizeof buf, payload)) > 0) fwrite(buf, 1, nn, out);
+    fclose(out); fclose(tar_tmp);
+    if (gz_tmp) fclose(gz_tmp);
+    return 0;
 }
 
 /* ---------------- ustar reader ---------------- */
@@ -271,21 +413,25 @@ static int tar_extract_all(const char *dest)
 {
     unsigned char h[512];
     for (;;) {
-        if (fread(h, 1, 512, tar_r) != 512) return -1;
+        if (fread(h, 1, 512, tar_r) != 512) { fprintf(stderr, "synthctl: tar: short header read\n"); return -1; }
         if (h[0] == 0) break; /* zero block = end */
         char name[101]; memcpy(name, h, 100); name[100] = 0;
+        char prefix[156]; memcpy(prefix, h + 345, 155); prefix[155] = 0;
+        char fullname[300];
+        if (prefix[0]) snprintf(fullname, sizeof fullname, "%s/%s", prefix, name);
+        else snprintf(fullname, sizeof fullname, "%s", name);
         long size = strtol((char *)h + 124, NULL, 8);
         mode_t mode = (mode_t)tar_oct(h + 100, 7);
         char type = h[156];
         /* refuse traversal: no absolute paths, no .. components */
-        if (name[0] == '/' || strstr(name, "../") || !strcmp(name, "..") ||
-            (strlen(name) > 2 && !strcmp(name + strlen(name) - 3, "/.."))) {
+        if (fullname[0] == '/' || strstr(fullname, "../") || !strcmp(fullname, "..") ||
+            (strlen(fullname) > 2 && !strcmp(fullname + strlen(fullname) - 3, "/.."))) {
             long skip = size + ((512 - (size % 512)) % 512);
             if (size > 0) fseek(tar_r, skip, SEEK_CUR);
             continue;
         }
         char out[4096];
-        snprintf(out, sizeof out, "%s/%s", dest, name);
+        snprintf(out, sizeof out, "%s/%s", dest, fullname);
         switch (type) {
         case '5':
             mkdir_p(out, mode ? mode : 0755); chmod(out, mode ? mode : 0755);
@@ -301,12 +447,12 @@ static int tar_extract_all(const char *dest)
             char *sl = strrchr(dirpart, '/');
             if (sl) { *sl = 0; mkdir_p(dirpart, 0755); }
             FILE *f = fopen(out, "wb");
-            if (!f) return -1;
+            if (!f) { fprintf(stderr, "synthctl: tar: cannot write %s: %s\n", out, strerror(errno)); return -1; }
             long left = size;
             char buf[65536];
             while (left > 0) {
                 size_t want = left > (long)sizeof buf ? sizeof buf : (size_t)left;
-                if (fread(buf, 1, want, tar_r) != want) { fclose(f); return -1; }
+                if (fread(buf, 1, want, tar_r) != want) { fprintf(stderr, "synthctl: tar: short data read at %s\n", fullname); fclose(f); return -1; }
                 fwrite(buf, 1, want, f);
                 left -= want;
             }
@@ -328,11 +474,6 @@ static int tar_extract_all(const char *dest)
 }
 
 /* ---------------- public API ---------------- */
-
-static uint32_t rd32le(const unsigned char *p)
-{ return p[0] | (p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
-static void wr32le(unsigned char *p, uint32_t v)
-{ p[0] = v & 0xff; p[1] = (v >> 8) & 0xff; p[2] = (v >> 16) & 0xff; p[3] = (v >> 24) & 0xff; }
 
 int image_build(const char *rootfs_dir, const struct manifest *m,
                 const char *out_path, int gzip_payload)
