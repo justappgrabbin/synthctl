@@ -4,7 +4,8 @@
  *                  [--env K=V]... [--workdir /w] [--hostname h] [--plain]
  *   synthctl inspect app.synthimg
  *   synthctl unpack app.synthimg <dir>
- *   synthctl run app.synthimg [-- cmd...] [--name hn] [--mem MB] [--pids N]
+ *   synthctl snapshot [-o me.synthimg] [--label N] [--include /p] [--exclude /p]
+ *   synthctl run app.synthimg [-- cmd...] [--hostname hn] [--mem MB] [--pids N]
  *                  [--ro] [--host-net]
  *   synthctl images                     (list unpacked image cache)
  */
@@ -27,6 +28,8 @@ static void usage(void)
         "     --name N --entry \"cmd\" --env K=V --workdir /w --hostname h --plain\n"
         "  inspect app.synthimg                    show manifest + verify sha256\n"
         "  unpack app.synthimg <dir>               extract image to a directory\n"
+        "  snapshot [-o me.synthimg] [opts]        clone THIS machine into an image\n"
+        "     --label N --include /p --exclude /p --max-file-mb N --plain\n"
         "  run app.synthimg [opts] [-- cmd...]     run a real container\n"
         "     --mem MB --pids N --ro --host-net --hostname h\n"
         "  images                                  list unpacked image cache\n");
@@ -140,9 +143,32 @@ static int cmd_run(int argc, char **argv)
     }
     opt.rootfs = dest;
 
+#ifdef __APPLE__
+    int rc = run_container_darwin(&opt);
+#else
     int rc = run_container(&opt);
+#endif
     manifest_free(&m);
     return rc;
+}
+
+static int cmd_snapshot(int argc, char **argv)
+{
+    const char *out = "clone.synthimg";
+    const char *label = NULL;
+    const char *inc[128]; int ni = 0;
+    const char *exc[128]; int nx = 0;
+    uint64_t maxmb = 0; int gzip = 1;
+    for (int i = 0; i < argc; i++) {
+        if (!strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
+        else if (!strcmp(argv[i], "--label") && i + 1 < argc) label = argv[++i];
+        else if (!strcmp(argv[i], "--include") && i + 1 < argc && ni < 128) inc[ni++] = argv[++i];
+        else if (!strcmp(argv[i], "--exclude") && i + 1 < argc && nx < 128) exc[nx++] = argv[++i];
+        else if (!strcmp(argv[i], "--max-file-mb") && i + 1 < argc) maxmb = strtoul(argv[++i], 0, 10);
+        else if (!strcmp(argv[i], "--plain")) gzip = 0;
+        else usage();
+    }
+    return snapshot_build(out, label, inc, ni, exc, nx, maxmb, gzip) ? 1 : 0;
 }
 
 static int cmd_images(void)
@@ -166,6 +192,7 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "build"))   return cmd_build(argc - 2, argv + 2);
     if (!strcmp(argv[1], "inspect")) return cmd_inspect(argc - 2, argv + 2);
     if (!strcmp(argv[1], "unpack"))  return cmd_unpack(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "snapshot")) return cmd_snapshot(argc - 2, argv + 2);
     if (!strcmp(argv[1], "run"))     return cmd_run(argc - 2, argv + 2);
     if (!strcmp(argv[1], "images"))  return cmd_images();
     usage();

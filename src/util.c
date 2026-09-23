@@ -142,13 +142,16 @@ int gzip_stream(FILE *src, FILE *dst)
  * must pass an explicit fd offset. */
 int gunzip_stream_at(int fd, long off, FILE *dst)
 {
-    if (lseek(fd, off, SEEK_SET) < 0) return -1;
+    if (lseek(fd, off, SEEK_SET) < 0) { perror("lseek"); return -1; }
     gzFile g = gzdopen(dup(fd), "rb");
-    if (!g) return -1;
+    if (!g) { fprintf(stderr, "gzdopen failed\n"); return -1; }
     uint8_t buf[65536]; int n;
     while ((n = gzread(g, buf, sizeof buf)) > 0)
-        if (fwrite(buf, 1, (size_t)n, dst) != (size_t)n) { gzclose(g); return -1; }
+        if (fwrite(buf, 1, (size_t)n, dst) != (size_t)n) { perror("fwrite"); gzclose(g); return -1; }
+    if (n < 0) { int err; fprintf(stderr, "gzread: %s\n", gzerror(g, &err)); }
     int ok = gzclose(g);
+    if (!(ok == Z_OK || ok == Z_STREAM_END || ok == Z_BUF_ERROR || n == 0))
+        fprintf(stderr, "gzclose rc=%d\n", ok);
     return (ok == Z_OK || ok == Z_STREAM_END || ok == Z_BUF_ERROR || n == 0) ? 0 : -1;
 }
 
